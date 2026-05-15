@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Smart AV1 encoder — adaptive per-chunk convex-hull search with slope-equalization
+Smallifier AV1 encoder — adaptive per-chunk convex-hull search with slope-equalization
 allocation. Maximizes duration-weighted mean VMAF subject to a size budget.
 
 Algorithm:
@@ -49,9 +49,16 @@ DEFAULT_SVT_PRESET    = 2
 # All exactly 16:9, mod-16 width, all mod-4+ height.
 RESOLUTION_LADDER = [(640, 360), (768, 432), (960, 540), (1280, 720), (1920, 1080)]
 
-# Per-resolution CRF samples. Three is enough for a usable Pareto sweep;
-# the convex hull combines points across resolutions anyway.
-CRFS_PER_RESOLUTION = [30, 40, 50]
+# Per-resolution CRF samples. Spans the useful AV1 range. CRF 56 covers
+# the tight-budget tail at the smallest resolution; without it, tight
+# budgets can end up with all-chunks-at-cheapest-option still exceeding
+# the size target (no smaller fallback exists).
+CRFS_PER_RESOLUTION = [30, 40, 50, 56]
+
+# Emergency probes — run only at the smallest ladder rung, only if the
+# cheapest Pareto combination still exceeds the size budget after the
+# main exploration phases. CRF 63 is AV1's hard maximum.
+EMERGENCY_CRFS = [60, 63]
 
 # Output resolution feasibility threshold (bits per pixel).
 # 0.05 bpp is a rough AV1 floor for fast-motion content to land VMAF ~75+.
@@ -317,6 +324,7 @@ def build_params(args, input_file, out_w, out_h):
         "out_h": out_h,
         "ladder": [list(r) for r in RESOLUTION_LADDER],
         "crfs": list(CRFS_PER_RESOLUTION),
+        "emergency_crfs": list(EMERGENCY_CRFS),
         "audio_bps": args.audio_bps,
     }
 
@@ -408,7 +416,7 @@ def allocate(chunks, video_budget):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Smart AV1 encoder. Maximizes weighted-mean VMAF at a size target."
+        description="Smallifier AV1 encoder. Maximizes weighted-mean VMAF at a size target."
     )
     p.add_argument("input")
     p.add_argument("output")
@@ -590,8 +598,55 @@ def main():
         print(f"\nExploration done. Avg {avg_pts:.1f} Pareto points/chunk; "
               f"max rung explored: {max_res[0]}x{max_res[1]}")
 
+        # ---- emergency probe at high CRFs if cheapest-feasible exceeds budget ----
+        cheapest_total = sum(c.pareto[0].size for c in chunks)
+        if cheapest_total > video_budget and EMERGENCY_CRFS:
+            over_mb = (cheapest_total - video_budget) / 1024 / 1024
+            print(f"\n! Cheapest combination ({cheapest_total/1024/1024:.2f} MB) "
+                  f"exceeds video budget by {over_mb:.2f} MB.")
+            print(f"  Emergency probe: CRFs {EMERGENCY_CRFS} at "
+                  f"{active_ladder[0][0]}x{active_ladder[0][1]}...")
+            smallest_w, smallest_h = active_ladder[0]
+            ej = []
+            for c in chunks:
+                for crf in EMERGENCY_CRFS:
+                    out = os.path.join(
+                        workdir, f"c{c.id:04d}_{smallest_w}x{smallest_h}_crf{crf}.mp4"
+                    )
+                    ej.append({
+                        "chunk_id": c.id, "out": out,
+                        "src": args.input, "start": c.start, "dur": c.duration,
+                        "pre_w": smallest_w, "pre_h": smallest_h,
+                        "out_w": out_w, "out_h": out_h, "out_fps": out_fps,
+                        "crf": crf, "preset": args.preset,
+                        "threads": threads_per_job, "bit_depth": args.bit_depth,
+                    })
+            with Pool(pool_size) as p:
+                er = p.map(run_trial, ej)
+            er = [r for r in er if r.get("ok")]
+            by_chunk = {}
+            for r in er:
+                by_chunk.setdefault(r["chunk_id"], []).append(r)
+            for c in chunks:
+                rs = by_chunk.get(c.id, [])
+                if rs:
+                    new_points = [OpPoint(
+                        size=r["size"], vmaf=r["vmaf"],
+                        pre_w=r["pre_w"], pre_h=r["pre_h"], crf=r["crf"],
+                        path=r["out"],
+                    ) for r in rs]
+                    c.pareto = pareto_filter(c.pareto + new_points)
+            new_cheapest = sum(c.pareto[0].size for c in chunks)
+            if new_cheapest <= video_budget:
+                print(f"  resolved: cheapest now "
+                      f"{new_cheapest/1024/1024:.2f} MB (fits)")
+            else:
+                still_over = (new_cheapest - video_budget) / 1024 / 1024
+                print(f"  ! still over by {still_over:.2f} MB even at CRF 63 "
+                      f"on smallest rung; output will exceed target")
+
         # ---- allocate ----
-        print(f"Allocating to {video_budget/1024/1024:.2f} MB video budget...")
+        print(f"\nAllocating to {video_budget/1024/1024:.2f} MB video budget...")
         allocate(chunks, video_budget)
 
         total_v = sum(c.choice.size for c in chunks)
@@ -634,8 +689,17 @@ def main():
         run(mux_cmd)
 
         final_mb = filesize(args.output) / (1024 * 1024)
-        err_pct = abs(final_mb - args.target_mb) / args.target_mb * 100
-        print(f"\nDone → {args.output} ({final_mb:.2f} MB, {err_pct:.1f}% error)")
+        delta_mb = final_mb - args.target_mb
+        delta_pct = delta_mb / args.target_mb * 100
+        if delta_mb > 0.01:
+            print(f"\nDone → {args.output} ({final_mb:.2f} MB, "
+                  f"OVER target by {delta_mb:.2f} MB / {delta_pct:+.1f}%)")
+            print("  ! Size constraint violated. Budget too tight even at maximum compression.")
+        elif delta_mb < -0.01:
+            print(f"\nDone → {args.output} ({final_mb:.2f} MB, "
+                  f"under target by {-delta_mb:.2f} MB / {delta_pct:+.1f}%)")
+        else:
+            print(f"\nDone → {args.output} ({final_mb:.2f} MB, on target)")
 
         if cleanup_on_success:
             shutil.rmtree(workdir, ignore_errors=True)
