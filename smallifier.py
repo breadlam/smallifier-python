@@ -41,9 +41,16 @@ from scenedetect.detectors import ContentDetector
 
 # ---------------- DEFAULTS ---------------- #
 DEFAULT_TARGET_MB     = 10.0
-DEFAULT_AUDIO_BPS     = 48_000
 DEFAULT_BIT_DEPTH     = 10
 DEFAULT_SVT_PRESET    = 2
+
+# Audio bitrate selection. None of these are user-tunable from CLI; the
+# user instead passes --audio-bps to override entirely.
+# Default behavior: scale audio with total budget, clamped to a
+# perceptually meaningful Opus range.
+AUDIO_FRACTION = 0.05      # 5% of total budget
+AUDIO_BPS_MIN  = 24_000    # Opus intelligibility floor for mixed content
+AUDIO_BPS_MAX  = 96_000    # near-transparent; above this is diminishing returns
 
 # Resolution ladder. Encoder walks up from smallest; capped at output res.
 # All exactly 16:9, mod-16 width, all mod-4+ height.
@@ -145,6 +152,13 @@ def choose_output_resolution(video_budget_bytes, total_duration, fps,
                 return (w, h), False
         return RESOLUTION_LADDER[0], False
     return max(feasible, key=lambda wh: wh[0] * wh[1]), True
+
+
+def choose_audio_bps(target_mb, duration):
+    """Default audio bitrate from total budget. AUDIO_FRACTION of total,
+    clamped to [AUDIO_BPS_MIN, AUDIO_BPS_MAX]. User --audio-bps overrides."""
+    total_bps = target_mb * 1024 * 1024 * 8 / max(duration, 0.001)
+    return int(max(AUDIO_BPS_MIN, min(AUDIO_BPS_MAX, total_bps * AUDIO_FRACTION)))
 
 
 # ---------------- SCENE DETECTION ---------------- #
@@ -422,8 +436,10 @@ def parse_args():
     p.add_argument("output")
     p.add_argument("-s", "--target-mb", type=float, default=DEFAULT_TARGET_MB,
                    help=f"Target output size in MB (default {DEFAULT_TARGET_MB}).")
-    p.add_argument("-a", "--audio-bps", type=int, default=DEFAULT_AUDIO_BPS,
-                   help=f"Opus audio bitrate (default {DEFAULT_AUDIO_BPS}).")
+    p.add_argument("-a", "--audio-bps", type=int, default=None,
+                   help=f"Opus audio bitrate in bps. Default: adaptive — "
+                        f"{int(AUDIO_FRACTION*100)} percent of total budget, "
+                        f"clamped to [{AUDIO_BPS_MIN}, {AUDIO_BPS_MAX}].")
     p.add_argument("-b", "--bit-depth", type=int, choices=[8, 10],
                    default=DEFAULT_BIT_DEPTH,
                    help=f"Output bit depth (default {DEFAULT_BIT_DEPTH}).")
@@ -451,6 +467,12 @@ def main():
 
     # ---- budget / output resolution decision ----
     budget = args.target_mb * 1024 * 1024 * CONTAINER_OVERHEAD
+
+    # Resolve audio bitrate: user override wins, else adaptive scaling.
+    audio_explicit = args.audio_bps is not None
+    if not audio_explicit:
+        args.audio_bps = choose_audio_bps(args.target_mb, duration)
+
     # Rough audio reservation; refined after encoding.
     audio_reserve = (args.audio_bps * duration / 8) if input_has_audio else 0
     video_budget = max(0, budget - audio_reserve)
@@ -491,7 +513,9 @@ def main():
         if input_has_audio:
             audio_path = os.path.join(workdir, "audio.opus")
             if not (os.path.exists(audio_path) and ffprobe_valid(audio_path)):
-                print("Encoding audio...")
+                print(f"Encoding audio at {args.audio_bps/1000:.0f} kbps Opus"
+                      + (" [user override]" if audio_explicit else " [adaptive]")
+                      + "...")
                 run([
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-i", args.input,
@@ -501,8 +525,10 @@ def main():
                 ])
             audio_size = filesize(audio_path)
             video_budget = max(0, budget - audio_size)
+            audio_pct = audio_size / (args.target_mb * 1024 * 1024) * 100
             print(f"  audio: {audio_size/1024:.1f} KiB "
-                  f"(video budget now {video_budget/1024/1024:.2f} MB)")
+                  f"({audio_pct:.1f}% of {args.target_mb} MB target)"
+                  f"; video budget now {video_budget/1024/1024:.2f} MB")
 
         # ---- scene detection ----
         print("Detecting scenes...")
