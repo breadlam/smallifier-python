@@ -2,9 +2,9 @@
 
 > **_Pin a video to an exact size. Maximize quality within that envelope._**
 
-### A specialized command-line AV1 encoder for size-budgeted video distribution. Optimized for fast-motion content with on-screen text, where conventional encoders compromise text legibility first. (I use it to post video game clips to discord.)
+**A specialized command-line AV1 encoder for size-budgeted video distribution. Optimized for fast-motion content with on-screen text, where conventional encoders compromise text legibility first. (_I use it to post video game clips to discord._)**
 
-### The naive way to hit a size target is to compute `target_bits / duration` and feed it as a bitrate to a two-pass encoder. The result is uniform mediocrity: easy scenes get more bits than they need, hard scenes get fewer than they need, and aggressive size targets produce uniformly poor output across the whole video. This tool does something different.
+**The naive way to hit a size target is to compute `target_bits / duration` and feed it as a bitrate to a two-pass encoder. The result is uniform mediocrity: easy scenes get more bits than they need, hard scenes get fewer than they need, and aggressive size targets produce uniformly poor output across the whole video. This tool does something different.**
 
 ## Some Notes On How It Works
 
