@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-Smart AV1 encoder — convex-hull per-chunk optimization with VMAF gating,
-optional ensemble encoding (SVT-AV1 + aomenc), and global size-budget allocation.
+Smart AV1 encoder — adaptive per-chunk convex-hull search with slope-equalization
+allocation. Maximizes duration-weighted mean VMAF subject to a size budget.
 
-Pipeline:
-  1. PySceneDetect ContentDetector finds scene boundaries.
-  2. For each chunk: do a (resolution × CRF) grid search with SVT-AV1
-     (and aomenc if --aomenc). Measure size and VMAF (NEG model) for each.
-  3. Compute Pareto frontier per chunk over (size, VMAF). The grid IS the
-     complexity probe — no separate analysis stage.
-  4. Global allocator: greedily pick operating points to hit size budget while
-     keeping every chunk above VMAF floor.
-  5. Concatenate winning encodes with `-c copy` (uniform output spec across
-     chunks), mux Opus audio, write final file.
+Algorithm:
+  1. Pick output resolution from budget feasibility (largest ladder rung where
+     a generous chunk allocation could plausibly hit 0.05+ bpp).
+  2. For each chunk, walk up the resolution ladder. At each rung, sample
+     several CRFs and merge results into the chunk's accumulated Pareto
+     frontier. Stop expanding when this rung adds nothing to the frontier
+     OR its smallest-size encode exceeds the chunk's max plausible allocation.
+  3. Globally allocate via greedy slope-equalization: repeatedly apply the
+     upgrade (across all chunks) with the best ΔVMAF × duration / Δbytes
+     ratio, until no further upgrade fits the budget.
+  4. Concatenate winners with `-c copy`, mux Opus audio.
 
-All time-range operations use accurate seek (`-ss` after `-i`), so chunk
-boundaries are frame-accurate without intermediate lossless files.
+No VMAF threshold — trust VMAF, accept whatever quality the budget buys.
 
-Resume: pass --workdir PATH. If PATH exists with matching params, work that's
-already on disk (trial mp4s + their vmaf json sidecars) is skipped. Without
---workdir a temp dir is used and cleaned on success.
+Resume: pass --workdir PATH. Trial encodes are cached by deterministic
+filename; matching params on rerun → cached work reused.
 
-Requires: ffmpeg with libsvtav1, libaom-av1, libopus, libvmaf compiled in;
+Requires: ffmpeg with libsvtav1, libopus, libvmaf compiled in;
 Python: `pip install scenedetect`.
 """
 
@@ -29,7 +28,6 @@ import os
 import sys
 import json
 import shutil
-import hashlib
 import tempfile
 import argparse
 import subprocess
@@ -43,51 +41,41 @@ from scenedetect.detectors import ContentDetector
 
 # ---------------- DEFAULTS ---------------- #
 DEFAULT_TARGET_MB     = 10.0
-DEFAULT_VMAF          = 90.0
 DEFAULT_AUDIO_BPS     = 48_000
 DEFAULT_BIT_DEPTH     = 10
 DEFAULT_SVT_PRESET    = 2
-DEFAULT_AOM_CPU_USED  = 2
 
-# Default grid: 3 resolutions × 5 CRFs. CRFs centered on the aggressive end
-# where ~10 MB / ~90 s targets actually land. Resolutions chosen for clean
-# encoder properties rather than display convention: all exactly 16:9,
-# mod-16 where possible, with clean Lanczos downscale ratios against the
-# 720p/1080p output target (e.g. 540p = exactly 1/2 of 1080p). 1080p is
-# omitted from the fast grid — at aggressive budgets it doesn't make the
-# convex hull, so trialing it just wastes compute.
-GRID_RESOLUTIONS_FAST = [(768, 432), (960, 540), (1280, 720)]
-GRID_CRFS_SVT_FAST    = [28, 33, 38, 43, 48]
-GRID_CRFS_AOM_FAST    = [28, 34, 40, 46, 52]
+# Resolution ladder. Encoder walks up from smallest; capped at output res.
+# All exactly 16:9, mod-16 width, all mod-4+ height.
+RESOLUTION_LADDER = [(640, 360), (768, 432), (960, 540), (1280, 720), (1920, 1080)]
 
-# Dense grid: 5 resolutions × 6 CRFs, for when --dense-grid is set. Adds
-# 360p below and 1080p above for budgets where they might land on the hull.
-GRID_RESOLUTIONS_DENSE = [(640, 360), (768, 432), (960, 540), (1280, 720), (1920, 1080)]
-GRID_CRFS_SVT_DENSE    = [22, 27, 32, 37, 42, 47]
-GRID_CRFS_AOM_DENSE    = [22, 28, 34, 40, 46, 52]
+# Per-resolution CRF samples. Three is enough for a usable Pareto sweep;
+# the convex hull combines points across resolutions anyway.
+CRFS_PER_RESOLUTION = [30, 40, 50]
 
-CONTAINER_OVERHEAD = 0.97
-SIZE_TOLERANCE     = 0.03
-VMAF_HEADROOM      = 0.5
+# Output resolution feasibility threshold (bits per pixel).
+# 0.05 bpp is a rough AV1 floor for fast-motion content to land VMAF ~75+.
+OUTPUT_BPP_FLOOR     = 0.05
+OUTPUT_BPP_HEADROOM  = 3.0   # a chunk can get up to 3× fair share
 
-VALID_MP4_MIN_BYTES = 1024
+# A chunk's max plausible allocation = (fair share) × this factor.
+CHUNK_BUDGET_HEADROOM = 5.0
+
+CONTAINER_OVERHEAD   = 0.97
+VALID_MP4_MIN_BYTES  = 1024
 
 
 # ---------------- SHELL / PROBE HELPERS ---------------- #
 
-def run(cmd, quiet=True):
-    subprocess.run(
-        cmd, check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL if quiet else None,
-    )
+def run(cmd):
+    subprocess.run(cmd, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def ffprobe_duration(path):
     out = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
     ])
     return float(out.strip())
 
@@ -108,8 +96,7 @@ def has_audio(path):
         "ffprobe", "-v", "error",
         "-select_streams", "a:0",
         "-show_entries", "stream=codec_type",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
     ]).strip()
     return out == b"audio"
 
@@ -117,110 +104,40 @@ def filesize(path):
     return os.path.getsize(path)
 
 def ffprobe_valid(path):
-    """Quick validity check: file parses without errors."""
     try:
-        subprocess.run(
-            ["ffprobe", "-v", "error", path],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=15,
-        )
+        subprocess.run(["ffprobe", "-v", "error", path],
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return False
 
 
-# ---------------- WORKDIR / RESUME ---------------- #
+# ---------------- OUTPUT RESOLUTION SELECTION ---------------- #
 
-def file_signature(path):
-    """Fast file identity — size + mtime. Good enough; hashing is too slow
-    for the multi-GB sources this script targets."""
-    st = os.stat(path)
-    return {"size": st.st_size, "mtime": int(st.st_mtime)}
+def choose_output_resolution(video_budget_bytes, total_duration, fps,
+                             src_w, src_h):
+    """Largest ladder rung where a generous chunk allocation could plausibly
+    hit OUTPUT_BPP_FLOOR. Caps at source resolution. Returns smallest rung
+    if budget is too tight for any rung — caller can warn."""
+    avg_bps = video_budget_bytes * 8 / max(total_duration, 0.001)
+    max_chunk_bps = avg_bps * OUTPUT_BPP_HEADROOM
 
-def build_params(args, input_file):
-    """Parameters that, if changed, invalidate cached trial encodes.
+    feasible = []
+    for (w, h) in RESOLUTION_LADDER:
+        if w > src_w or h > src_h:
+            continue
+        bpp = max_chunk_bps / (w * h * fps)
+        if bpp >= OUTPUT_BPP_FLOOR:
+            feasible.append((w, h))
 
-    target_mb and vmaf threshold are deliberately excluded — they only affect
-    allocation, so changing them lets you re-allocate without re-encoding."""
-    sig = file_signature(input_file)
-    return {
-        "input_file": os.path.abspath(input_file),
-        "input_size": sig["size"],
-        "input_mtime": sig["mtime"],
-        "bit_depth": args.bit_depth,
-        "preset": args.preset,
-        "aom_cpu_used": args.aom_cpu_used,
-        "use_aomenc": args.use_aomenc,
-        "resolutions": [list(r) for r in args.resolutions],
-        "crfs_svt": list(args.crfs_svt),
-        "crfs_aom": list(args.crfs_aom) if args.use_aomenc else [],
-        "audio_bps": args.audio_bps,
-    }
-
-def setup_workdir(args):
-    """Decide on workdir path; check param compatibility for resume.
-    Returns (workdir, will_be_cleaned_on_success, resuming)."""
-    params = build_params(args, args.input)
-
-    if args.workdir:
-        wd = args.workdir
-        cleanup = False
-        os.makedirs(wd, exist_ok=True)
-        params_path = os.path.join(wd, "params.json")
-        if os.path.exists(params_path):
-            with open(params_path) as f:
-                existing = json.load(f)
-            if existing != params:
-                # Pinpoint what's different for a useful error.
-                diffs = []
-                for k in set(existing) | set(params):
-                    if existing.get(k) != params.get(k):
-                        diffs.append(f"  {k}: {existing.get(k)!r} → {params.get(k)!r}")
-                sys.exit(
-                    f"Workdir {wd} was created with different parameters. "
-                    f"Refusing to mix encodes.\n"
-                    + "\n".join(diffs) +
-                    f"\n\nEither delete {wd}, or use a different --workdir."
-                )
-            return wd, False, True
-        else:
-            with open(params_path, "w") as f:
-                json.dump(params, f, indent=2)
-            return wd, False, False
-    else:
-        wd = tempfile.mkdtemp(prefix="smart_av1_", dir="/tmp")
-        with open(os.path.join(wd, "params.json"), "w") as f:
-            json.dump(params, f, indent=2)
-        return wd, True, False
-
-def _validate_one(path):
-    """Worker for parallel resume-sweep validation. Returns path if invalid."""
-    if os.path.getsize(path) < VALID_MP4_MIN_BYTES:
-        return path
-    return None if ffprobe_valid(path) else path
-
-def sweep_invalid(workdir, pool_size):
-    """Find and delete corrupt .mp4 trial files (and their .vmaf.json
-    sidecars). Catches encodes killed mid-write on the prior run."""
-    paths = [os.path.join(workdir, f) for f in os.listdir(workdir)
-             if f.endswith(".mp4") and f.startswith("c")]
-    if not paths:
-        return 0
-    with Pool(pool_size) as p:
-        results = p.map(_validate_one, paths)
-    bad = [r for r in results if r]
-    for b in bad:
-        try:
-            os.unlink(b)
-        except OSError:
-            pass
-        v = b + ".vmaf.json"
-        if os.path.exists(v):
-            try:
-                os.unlink(v)
-            except OSError:
-                pass
-    return len(bad)
+    if not feasible:
+        # Pick the smallest source-fitting rung anyway.
+        for (w, h) in RESOLUTION_LADDER:
+            if w <= src_w and h <= src_h:
+                return (w, h), False
+        return RESOLUTION_LADDER[0], False
+    return max(feasible, key=lambda wh: wh[0] * wh[1]), True
 
 
 # ---------------- SCENE DETECTION ---------------- #
@@ -236,10 +153,10 @@ def detect_scenes(input_file, min_scene_sec=1.0):
     scenes = sm.get_scene_list()
     if not scenes:
         return [(0.0, ffprobe_duration(input_file))]
-    return [(s.get_seconds(), e.get_seconds()) for s, e in scenes]
+    return [(s.seconds, e.seconds) for s, e in scenes]
 
 
-# ---------------- ENCODE PARAM BUILDERS ---------------- #
+# ---------------- ENCODE / VMAF ---------------- #
 
 def svt_params(threads):
     return (
@@ -285,34 +202,6 @@ def svt_cmd(src, start, dur, out_path, pre_w, pre_h, out_w, out_h, out_fps,
         out_path,
     ]
 
-def aom_cmd(src, start, dur, out_path, pre_w, pre_h, out_w, out_h, out_fps,
-            crf, cpu_used, threads, bit_depth):
-    pix_fmt = "yuv420p10le" if bit_depth == 10 else "yuv420p"
-    return [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", f"{start:.6f}",
-        "-i", src,
-        "-t", f"{dur:.6f}",
-        "-vf", _scaling_vf(pre_w, pre_h, out_w, out_h, out_fps),
-        "-c:v", "libaom-av1",
-        "-cpu-used", str(cpu_used),
-        "-crf", str(crf),
-        "-b:v", "0",
-        "-aq-mode", "2",
-        "-arnr-strength", "0",
-        "-tune-content", "default",
-        "-row-mt", "1",
-        "-tile-columns", "1",
-        "-pix_fmt", pix_fmt,
-        "-g", "240",
-        "-threads", str(threads),
-        "-an",
-        out_path,
-    ]
-
-
-# ---------------- VMAF (NEG model) ---------------- #
-
 def _parse_vmaf_json(path):
     with open(path) as f:
         data = json.load(f)
@@ -320,16 +209,12 @@ def _parse_vmaf_json(path):
 
 def compute_vmaf(distorted, reference, start, dur, out_w, out_h, out_fps, threads):
     log_path = distorted + ".vmaf.json"
-    # Reuse cached result if present and parseable.
     if os.path.exists(log_path):
         try:
             return _parse_vmaf_json(log_path)
         except (json.JSONDecodeError, KeyError, OSError):
-            try:
-                os.unlink(log_path)
-            except OSError:
-                pass
-
+            try: os.unlink(log_path)
+            except OSError: pass
     filt = (
         f"[0:v]scale={out_w}:{out_h}:flags=lanczos,fps={out_fps},"
         f"setpts=PTS-STARTPTS[d];"
@@ -356,7 +241,6 @@ def compute_vmaf(distorted, reference, start, dur, out_w, out_h, out_fps, thread
 class OpPoint:
     size: int
     vmaf: float = field(compare=False)
-    encoder: str = field(compare=False)
     pre_w: int = field(compare=False)
     pre_h: int = field(compare=False)
     crf: int = field(compare=False)
@@ -380,10 +264,9 @@ class Chunk:
         return self.pareto[self.choice_idx]
 
 
-# ---------------- CONVEX HULL ---------------- #
-
 def pareto_filter(points):
-    pts = sorted(points, key=lambda p: p.size)
+    """Size-ascending, VMAF strictly increasing."""
+    pts = sorted(points, key=lambda p: (p.size, -p.vmaf))
     out = []
     best_vmaf = -1.0
     for p in pts:
@@ -392,69 +275,21 @@ def pareto_filter(points):
             best_vmaf = p.vmaf
     return out
 
-def trial_jobs_for_chunk(src, chunk, workdir, out_w, out_h, out_fps,
-                         source_w, source_h, args, threads):
-    jobs = []
-    resolutions = [(w, h) for (w, h) in args.resolutions
-                   if w <= source_w and h <= source_h]
-    if (out_w, out_h) not in resolutions:
-        resolutions.append((out_w, out_h))
 
-    for (pre_w, pre_h) in resolutions:
-        for crf in args.crfs_svt:
-            out = os.path.join(
-                workdir, f"c{chunk.id:04d}_svt_{pre_w}x{pre_h}_crf{crf}.mp4"
-            )
-            jobs.append({
-                "chunk_id": chunk.id, "encoder": "svt",
-                "pre_w": pre_w, "pre_h": pre_h, "crf": crf,
-                "out": out, "src": src, "start": chunk.start, "dur": chunk.duration,
-                "out_w": out_w, "out_h": out_h, "out_fps": out_fps,
-                "preset": args.preset, "threads": threads,
-                "bit_depth": args.bit_depth,
-            })
-        if args.use_aomenc:
-            for crf in args.crfs_aom:
-                out = os.path.join(
-                    workdir, f"c{chunk.id:04d}_aom_{pre_w}x{pre_h}_crf{crf}.mp4"
-                )
-                jobs.append({
-                    "chunk_id": chunk.id, "encoder": "aom",
-                    "pre_w": pre_w, "pre_h": pre_h, "crf": crf,
-                    "out": out, "src": src, "start": chunk.start, "dur": chunk.duration,
-                    "out_w": out_w, "out_h": out_h, "out_fps": out_fps,
-                    "cpu_used": args.aom_cpu_used, "threads": threads,
-                    "bit_depth": args.bit_depth,
-                })
-    return jobs
+# ---------------- TRIAL WORKER ---------------- #
 
 def run_trial(job):
-    """Encode + measure VMAF. Idempotent: skips work already on disk.
-
-    Combined into one worker call so a worker handling a "resumed" trial
-    can do both the encode-skip and the VMAF-fetch in one round-trip,
-    minimizing IPC overhead when most work is cached."""
+    """Encode + VMAF for one (chunk, prefilter_res, CRF) trial. Idempotent."""
     out_path = job["out"]
-    encode_needed = (
-        not os.path.exists(out_path)
-        or os.path.getsize(out_path) < VALID_MP4_MIN_BYTES
-    )
     try:
-        if encode_needed:
-            if job["encoder"] == "svt":
-                cmd = svt_cmd(
-                    job["src"], job["start"], job["dur"], out_path,
-                    job["pre_w"], job["pre_h"],
-                    job["out_w"], job["out_h"], job["out_fps"],
-                    job["crf"], job["preset"], job["threads"], job["bit_depth"],
-                )
-            else:
-                cmd = aom_cmd(
-                    job["src"], job["start"], job["dur"], out_path,
-                    job["pre_w"], job["pre_h"],
-                    job["out_w"], job["out_h"], job["out_fps"],
-                    job["crf"], job["cpu_used"], job["threads"], job["bit_depth"],
-                )
+        if (not os.path.exists(out_path)
+                or os.path.getsize(out_path) < VALID_MP4_MIN_BYTES):
+            cmd = svt_cmd(
+                job["src"], job["start"], job["dur"], out_path,
+                job["pre_w"], job["pre_h"],
+                job["out_w"], job["out_h"], job["out_fps"],
+                job["crf"], job["preset"], job["threads"], job["bit_depth"],
+            )
             run(cmd)
         job["size"] = filesize(out_path)
         job["vmaf"] = compute_vmaf(
@@ -468,63 +303,117 @@ def run_trial(job):
     return job
 
 
-# ---------------- GLOBAL ALLOCATOR ---------------- #
+# ---------------- WORKDIR / RESUME ---------------- #
 
-def initial_selection(chunks, vmaf_target):
+def build_params(args, input_file, out_w, out_h):
+    st = os.stat(input_file)
+    return {
+        "input_file": os.path.abspath(input_file),
+        "input_size": st.st_size,
+        "input_mtime": int(st.st_mtime),
+        "bit_depth": args.bit_depth,
+        "preset": args.preset,
+        "out_w": out_w,
+        "out_h": out_h,
+        "ladder": [list(r) for r in RESOLUTION_LADDER],
+        "crfs": list(CRFS_PER_RESOLUTION),
+        "audio_bps": args.audio_bps,
+    }
+
+def setup_workdir(args, params):
+    if args.workdir:
+        wd = args.workdir
+        os.makedirs(wd, exist_ok=True)
+        pp = os.path.join(wd, "params.json")
+        if os.path.exists(pp):
+            with open(pp) as f:
+                existing = json.load(f)
+            if existing != params:
+                diffs = []
+                for k in set(existing) | set(params):
+                    if existing.get(k) != params.get(k):
+                        diffs.append(f"  {k}: {existing.get(k)!r} → {params.get(k)!r}")
+                sys.exit(f"Workdir {wd} has different params:\n"
+                         + "\n".join(diffs) +
+                         f"\nUse a different --workdir or delete {wd}.")
+            return wd, False, True
+        with open(pp, "w") as f:
+            json.dump(params, f, indent=2)
+        return wd, False, False
+    wd = tempfile.mkdtemp(prefix="smart_av1_", dir="/tmp")
+    with open(os.path.join(wd, "params.json"), "w") as f:
+        json.dump(params, f, indent=2)
+    return wd, True, False
+
+def _validate_one(path):
+    if os.path.getsize(path) < VALID_MP4_MIN_BYTES:
+        return path
+    return None if ffprobe_valid(path) else path
+
+def sweep_invalid(workdir, pool_size):
+    paths = [os.path.join(workdir, f) for f in os.listdir(workdir)
+             if f.endswith(".mp4") and f.startswith("c")]
+    if not paths:
+        return 0
+    with Pool(pool_size) as p:
+        results = p.map(_validate_one, paths)
+    bad = [r for r in results if r]
+    for b in bad:
+        try: os.unlink(b)
+        except OSError: pass
+        v = b + ".vmaf.json"
+        if os.path.exists(v):
+            try: os.unlink(v)
+            except OSError: pass
+    return len(bad)
+
+
+# ---------------- ALLOCATOR (slope equalization) ---------------- #
+
+def allocate(chunks, video_budget):
+    """Greedy slope-equalization. Starts every chunk at its smallest Pareto
+    point. Repeatedly applies the (chunk, upgrade) pair with the highest
+    ΔVMAF × duration / Δsize, subject to fitting in the remaining budget.
+    Terminates when no candidate upgrade fits."""
     for c in chunks:
-        passing = [(i, p) for i, p in enumerate(c.pareto) if p.vmaf >= vmaf_target]
-        if passing:
-            c.choice_idx = min(passing, key=lambda ip: ip[1].size)[0]
-        else:
-            c.choice_idx = max(range(len(c.pareto)),
-                               key=lambda i: c.pareto[i].vmaf)
-
-def allocate_to_budget(chunks, budget_bytes, vmaf_target, max_steps=2000):
-    for _ in range(max_steps):
+        c.choice_idx = 0
+    while True:
         total = sum(c.choice.size for c in chunks)
-
-        if total > budget_bytes:
-            cands = [c for c in chunks
-                     if c.choice_idx > 0
-                     and c.choice.vmaf >= vmaf_target + VMAF_HEADROOM]
-            if not cands:
-                cands = [c for c in chunks if c.choice_idx > 0]
-                if not cands:
-                    break
-            pick = max(cands, key=lambda c: c.choice.vmaf - vmaf_target)
-            pick.choice_idx -= 1
-
-        elif total < budget_bytes * (1.0 - SIZE_TOLERANCE):
-            below = [c for c in chunks
-                     if c.choice.vmaf < vmaf_target
-                     and c.choice_idx < len(c.pareto) - 1]
-            if below:
-                pick = min(below, key=lambda c: c.choice.vmaf)
-            else:
-                cands = [c for c in chunks if c.choice_idx < len(c.pareto) - 1]
-                if not cands:
-                    break
-                pick = min(cands, key=lambda c: c.choice.vmaf)
-            next_pt = pick.pareto[pick.choice_idx + 1]
-            if total + (next_pt.size - pick.choice.size) > budget_bytes:
-                break
-            pick.choice_idx += 1
-        else:
+        remaining = video_budget - total
+        if remaining <= 0:
             break
+        best = None
+        best_value = -1.0
+        for c in chunks:
+            if c.choice_idx >= len(c.pareto) - 1:
+                continue
+            cur = c.pareto[c.choice_idx]
+            nxt = c.pareto[c.choice_idx + 1]
+            dsize = nxt.size - cur.size
+            if dsize <= 0 or dsize > remaining:
+                continue
+            dvmaf = nxt.vmaf - cur.vmaf
+            if dvmaf <= 0:
+                continue
+            value = dvmaf * c.duration / dsize
+            if value > best_value:
+                best_value = value
+                best = c
+        if best is None:
+            break
+        best.choice_idx += 1
 
 
 # ---------------- MAIN PIPELINE ---------------- #
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Smart AV1 encoder with convex-hull per-chunk optimization."
+        description="Smart AV1 encoder. Maximizes weighted-mean VMAF at a size target."
     )
     p.add_argument("input")
     p.add_argument("output")
     p.add_argument("-s", "--target-mb", type=float, default=DEFAULT_TARGET_MB,
                    help=f"Target output size in MB (default {DEFAULT_TARGET_MB}).")
-    p.add_argument("-v", "--vmaf", type=float, default=DEFAULT_VMAF,
-                   help=f"Per-chunk VMAF floor (default {DEFAULT_VMAF}).")
     p.add_argument("-a", "--audio-bps", type=int, default=DEFAULT_AUDIO_BPS,
                    help=f"Opus audio bitrate (default {DEFAULT_AUDIO_BPS}).")
     p.add_argument("-b", "--bit-depth", type=int, choices=[8, 10],
@@ -532,177 +421,199 @@ def parse_args():
                    help=f"Output bit depth (default {DEFAULT_BIT_DEPTH}).")
     p.add_argument("--preset", type=int, default=DEFAULT_SVT_PRESET,
                    help=f"SVT-AV1 preset 0-13 (default {DEFAULT_SVT_PRESET}).")
-    p.add_argument("--aom-cpu-used", type=int, default=DEFAULT_AOM_CPU_USED,
-                   help=f"aomenc cpu-used 0-8 (default {DEFAULT_AOM_CPU_USED}).")
-    p.add_argument("--aomenc", action="store_true",
-                   help="Add aomenc to the trial ensemble (roughly doubles "
-                        "compute; chunk-by-chunk the better encoder is kept).")
-    p.add_argument("--dense-grid", action="store_true",
-                   help="Use a 5-resolution × 6-CRF grid instead of the "
-                        "default 3 × 5 (2x more trials).")
     p.add_argument("--workdir", type=str, default=None,
-                   help="Explicit work directory (persistent across runs). "
-                        "Required for resume; with matching params, existing "
-                        "trial encodes and VMAF scores are reused.")
+                   help="Persistent workdir for resume. Default: /tmp/smart_av1_*.")
     p.add_argument("--workers", type=int, default=0,
-                   help="Worker process count (0 = auto).")
+                   help="Worker count (0 = auto).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    args.use_aomenc = args.aomenc
-
-    # bind grid
-    if args.dense_grid:
-        args.resolutions = GRID_RESOLUTIONS_DENSE
-        args.crfs_svt    = GRID_CRFS_SVT_DENSE
-        args.crfs_aom    = GRID_CRFS_AOM_DENSE
-    else:
-        args.resolutions = GRID_RESOLUTIONS_FAST
-        args.crfs_svt    = GRID_CRFS_SVT_FAST
-        args.crfs_aom    = GRID_CRFS_AOM_FAST
-
     if not os.path.exists(args.input):
         sys.exit(f"Input not found: {args.input}")
 
-    workdir, cleanup_on_success, resuming = setup_workdir(args)
-    print(f"Workdir: {workdir}  ({'resuming' if resuming else 'fresh'})")
+    # ---- probe ----
+    duration = ffprobe_duration(args.input)
+    src_w, src_h, src_fps, src_pix = ffprobe_video(args.input)
+    input_has_audio = has_audio(args.input)
+    out_fps = min(30.0, src_fps)
+    print(f"Source: {src_w}x{src_h} @ {src_fps:.2f}fps, "
+          f"{duration:.1f}s, pix={src_pix}, audio={input_has_audio}")
+
+    # ---- budget / output resolution decision ----
+    budget = args.target_mb * 1024 * 1024 * CONTAINER_OVERHEAD
+    # Rough audio reservation; refined after encoding.
+    audio_reserve = (args.audio_bps * duration / 8) if input_has_audio else 0
+    video_budget = max(0, budget - audio_reserve)
+
+    (out_w, out_h), feasible = choose_output_resolution(
+        video_budget, duration, out_fps, src_w, src_h
+    )
+    avg_bps = video_budget * 8 / duration
+    avg_bpp = avg_bps / (out_w * out_h * out_fps)
+    print(f"Budget: {args.target_mb} MB total → video ~{video_budget/1024/1024:.2f} MB "
+          f"(avg {avg_bps/1000:.0f} kbps)")
+    print(f"Output: {out_w}x{out_h} @ {out_fps}fps, {args.bit_depth}-bit "
+          f"({avg_bpp:.3f} avg bpp)")
+    if not feasible:
+        print(f"  ! budget gives <{OUTPUT_BPP_FLOOR} bpp even at smallest "
+              f"resolution; quality will be poor regardless of CRF.")
+
+    # ---- workdir ----
+    params = build_params(args, args.input, out_w, out_h)
+    workdir, cleanup_on_success, resuming = setup_workdir(args, params)
+    print(f"Workdir: {workdir} ({'resuming' if resuming else 'fresh'})")
 
     try:
-        # ---- probe ----
-        duration = ffprobe_duration(args.input)
-        src_w, src_h, src_fps, src_pix = ffprobe_video(args.input)
-        input_has_audio = has_audio(args.input)
-        print(f"Source: {src_w}x{src_h} @ {src_fps:.2f}fps, "
-              f"{duration:.1f}s, pix={src_pix}, audio={input_has_audio}")
-
         # ---- pool sizing ----
         cores = args.workers if args.workers else cpu_count()
         threads_per_job = max(2, min(8, cores // 16))
         pool_size = max(1, cores // threads_per_job)
-        print(f"Pool: {pool_size} workers × {threads_per_job} threads "
-              f"({pool_size * threads_per_job} threads total)")
+        print(f"Pool: {pool_size} × {threads_per_job} threads")
 
-        # ---- resume sweep: nuke partial/corrupt trial files ----
         if resuming:
-            print("Validating existing trial files...")
             bad = sweep_invalid(workdir, pool_size)
             if bad:
-                print(f"  removed {bad} corrupt file(s); they'll be re-encoded")
+                print(f"  removed {bad} corrupt cached file(s)")
 
         # ---- audio ----
         audio_path = None
         audio_size = 0
         if input_has_audio:
             audio_path = os.path.join(workdir, "audio.opus")
-            if not (os.path.exists(audio_path)
-                    and os.path.getsize(audio_path) > 0
-                    and ffprobe_valid(audio_path)):
+            if not (os.path.exists(audio_path) and ffprobe_valid(audio_path)):
                 print("Encoding audio...")
                 run([
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-i", args.input,
                     "-vn", "-c:a", "libopus",
-                    "-b:a", str(args.audio_bps),
-                    "-vbr", "on",
+                    "-b:a", str(args.audio_bps), "-vbr", "on",
                     audio_path,
                 ])
             audio_size = filesize(audio_path)
-            print(f"  audio: {audio_size/1024:.1f} KiB")
+            video_budget = max(0, budget - audio_size)
+            print(f"  audio: {audio_size/1024:.1f} KiB "
+                  f"(video budget now {video_budget/1024/1024:.2f} MB)")
 
         # ---- scene detection ----
-        # Always re-run; PySceneDetect is deterministic given the same input.
-        print("Detecting scenes (PySceneDetect ContentDetector)...")
+        print("Detecting scenes...")
         scene_ranges = detect_scenes(args.input)
         chunks = [Chunk(id=i, start=s, end=e)
                   for i, (s, e) in enumerate(scene_ranges) if e - s >= 0.2]
         if not chunks:
-            sys.exit("No usable scenes detected.")
+            sys.exit("No usable scenes.")
         med = sorted(c.duration for c in chunks)[len(chunks)//2]
-        print(f"  {len(chunks)} chunks (median {med:.2f}s)")
+        print(f"  {len(chunks)} chunks, median {med:.2f}s")
 
-        # ---- output spec ----
-        available = [(w, h) for (w, h) in args.resolutions
-                     if w <= src_w and h <= src_h]
-        if not available:
-            available = [(src_w, src_h)]
-        out_w, out_h = max(available, key=lambda wh: wh[0] * wh[1])
-        out_w -= out_w % 2
-        out_h -= out_h % 2
-        out_fps = min(30.0, src_fps)
-        encoder_label = "SVT-AV1+aomenc" if args.use_aomenc else "SVT-AV1"
-        grid_label = "dense" if args.dense_grid else "fast"
-        print(f"Output: {out_w}x{out_h} @ {out_fps}fps, "
-              f"{args.bit_depth}-bit, encoders={encoder_label}, grid={grid_label}")
+        # ---- ladder bounded by output resolution and source ----
+        active_ladder = [(w, h) for (w, h) in RESOLUTION_LADDER
+                         if w <= out_w and h <= out_h and w <= src_w and h <= src_h]
+        if not active_ladder:
+            active_ladder = [(out_w, out_h)]
+        print(f"Ladder: {' → '.join(f'{w}x{h}' for w,h in active_ladder)}")
 
-        # ---- build all trial jobs ----
-        all_jobs = []
-        for c in chunks:
-            all_jobs.extend(trial_jobs_for_chunk(
-                args.input, c, workdir, out_w, out_h, out_fps,
-                src_w, src_h, args, threads_per_job,
-            ))
-        # Count what's already done.
-        cached = sum(
-            1 for j in all_jobs
-            if os.path.exists(j["out"])
-            and os.path.getsize(j["out"]) >= VALID_MP4_MIN_BYTES
-            and os.path.exists(j["out"] + ".vmaf.json")
-        )
-        if resuming and cached:
-            print(f"  {cached}/{len(all_jobs)} trials already complete on disk")
-        print(f"\nRunning {len(all_jobs)} trials "
-              f"({len(all_jobs) // len(chunks)} per chunk)...")
+        # ---- adaptive per-chunk expansion across phases ----
+        # Each phase encodes one resolution for all currently active chunks.
+        # Chunks drop out of the active set when their next-rung exploration
+        # would be (a) dominated by accumulated frontier OR (b) too expensive
+        # for their max plausible allocation.
+        active = list(chunks)
+        for phase_idx, (pre_w, pre_h) in enumerate(active_ladder):
+            if not active:
+                break
+            jobs = []
+            for c in active:
+                for crf in CRFS_PER_RESOLUTION:
+                    out = os.path.join(
+                        workdir, f"c{c.id:04d}_{pre_w}x{pre_h}_crf{crf}.mp4"
+                    )
+                    jobs.append({
+                        "chunk_id": c.id, "out": out,
+                        "src": args.input, "start": c.start, "dur": c.duration,
+                        "pre_w": pre_w, "pre_h": pre_h,
+                        "out_w": out_w, "out_h": out_h, "out_fps": out_fps,
+                        "crf": crf, "preset": args.preset,
+                        "threads": threads_per_job, "bit_depth": args.bit_depth,
+                    })
+            cached = sum(
+                1 for j in jobs
+                if os.path.exists(j["out"])
+                and os.path.getsize(j["out"]) >= VALID_MP4_MIN_BYTES
+                and os.path.exists(j["out"] + ".vmaf.json")
+            )
+            print(f"\nPhase {phase_idx+1}/{len(active_ladder)}: {pre_w}x{pre_h} "
+                  f"— {len(active)} chunks × {len(CRFS_PER_RESOLUTION)} CRFs"
+                  + (f" ({cached} cached)" if cached else ""))
+            with Pool(pool_size) as p:
+                results = p.map(run_trial, jobs)
+            results = [r for r in results if r.get("ok")]
 
-        # ---- run trials (idempotent — skips cached work per-job) ----
-        with Pool(pool_size) as p:
-            scored_jobs = p.map(run_trial, all_jobs)
-        scored_jobs = [j for j in scored_jobs if j.get("ok")]
-        failed = len(all_jobs) - len(scored_jobs)
-        if failed:
-            print(f"  ! {failed} trial(s) failed")
-        print(f"  {len(scored_jobs)} trials succeeded")
+            # Group by chunk; update frontiers; decide who continues.
+            by_chunk = {}
+            for r in results:
+                by_chunk.setdefault(r["chunk_id"], []).append(r)
 
-        # ---- build per-chunk Pareto frontiers ----
-        chunk_by_id = {c.id: c for c in chunks}
-        raw_per_chunk = {c.id: [] for c in chunks}
-        for j in scored_jobs:
-            raw_per_chunk[j["chunk_id"]].append(OpPoint(
-                size=j["size"], vmaf=j["vmaf"], encoder=j["encoder"],
-                pre_w=j["pre_w"], pre_h=j["pre_h"], crf=j["crf"], path=j["out"],
-            ))
-        for cid, points in raw_per_chunk.items():
-            if not points:
-                sys.exit(f"Chunk {cid} has no successful trials.")
-            chunk_by_id[cid].pareto = pareto_filter(points)
-        avg_pts = sum(len(c.pareto) for c in chunks) / len(chunks)
-        print(f"  avg {avg_pts:.1f} Pareto points per chunk")
+            next_active = []
+            for c in active:
+                rs = by_chunk.get(c.id, [])
+                if not rs:
+                    continue  # all failed; stop expanding
+                new_points = [OpPoint(
+                    size=r["size"], vmaf=r["vmaf"],
+                    pre_w=r["pre_w"], pre_h=r["pre_h"], crf=r["crf"],
+                    path=r["out"],
+                ) for r in rs]
+                new_pareto = pareto_filter(c.pareto + new_points)
+                # Did this rung contribute anything?
+                added = [p for p in new_pareto if (p.pre_w, p.pre_h) == (pre_w, pre_h)]
+                c.pareto = new_pareto
+                if not added:
+                    continue  # dominated; larger rungs will be too
+                # Can this chunk plausibly afford the next rung?
+                max_chunk_bytes = (video_budget
+                                   * (c.duration / duration)
+                                   * CHUNK_BUDGET_HEADROOM)
+                min_size_here = min(r["size"] for r in rs)
+                if min_size_here > max_chunk_bytes:
+                    continue  # can't even afford this rung's cheapest
+                next_active.append(c)
+            dropped = len(active) - len(next_active)
+            if dropped:
+                print(f"  {dropped} chunk(s) stopped expanding after this rung")
+            active = next_active
+
+        # ---- summary of exploration ----
+        avg_pts  = sum(len(c.pareto) for c in chunks) / len(chunks)
+        max_res  = max((max((p.pre_w, p.pre_h) for p in c.pareto) for c in chunks),
+                       default=(0,0))
+        print(f"\nExploration done. Avg {avg_pts:.1f} Pareto points/chunk; "
+              f"max rung explored: {max_res[0]}x{max_res[1]}")
 
         # ---- allocate ----
-        budget = args.target_mb * 1024 * 1024 * CONTAINER_OVERHEAD
-        video_budget = max(0, budget - audio_size)
-        print(f"\nAllocating to budget ({video_budget/1024/1024:.2f} MB video)...")
-        initial_selection(chunks, args.vmaf)
-        allocate_to_budget(chunks, video_budget, args.vmaf)
+        print(f"Allocating to {video_budget/1024/1024:.2f} MB video budget...")
+        allocate(chunks, video_budget)
 
-        total_video = sum(c.choice.size for c in chunks)
-        total = total_video + audio_size
-        below = [c for c in chunks if c.choice.vmaf < args.vmaf]
-        mean_vmaf = sum(c.choice.vmaf for c in chunks) / len(chunks)
+        total_v = sum(c.choice.size for c in chunks)
+        total = total_v + audio_size
+        mean_vmaf = (sum(c.choice.vmaf * c.duration for c in chunks)
+                     / sum(c.duration for c in chunks))
         min_vmaf = min(c.choice.vmaf for c in chunks)
+        max_vmaf = max(c.choice.vmaf for c in chunks)
         print(f"Total: {total/1024/1024:.2f} MB "
-              f"(video {total_video/1024/1024:.2f} + "
-              f"audio {audio_size/1024/1024:.2f}) "
-              f"/ {args.target_mb} MB target")
-        print(f"VMAF: mean {mean_vmaf:.2f}, min {min_vmaf:.2f}, "
-              f"{len(below)}/{len(chunks)} below {args.vmaf}")
-        if below:
-            print(f"  ! {len(below)} chunk(s) unable to meet VMAF at this budget")
-        if args.use_aomenc:
-            svt_picked = sum(1 for c in chunks if c.choice.encoder == "svt")
-            aom_picked = sum(1 for c in chunks if c.choice.encoder == "aom")
-            print(f"Encoder picks: SVT-AV1 {svt_picked}, aomenc {aom_picked}")
+              f"(video {total_v/1024/1024:.2f} + audio {audio_size/1024/1024:.2f}) "
+              f"/ {args.target_mb} MB")
+        print(f"VMAF: duration-weighted mean {mean_vmaf:.2f}, "
+              f"range [{min_vmaf:.2f}, {max_vmaf:.2f}]")
+
+        # ---- per-chunk diagnostic ----
+        from collections import Counter
+        res_counts = Counter((c.choice.pre_w, c.choice.pre_h) for c in chunks)
+        crf_counts = Counter(c.choice.crf for c in chunks)
+        print("Chunk choices:")
+        for (w, h), n in sorted(res_counts.items()):
+            print(f"  {w}x{h}: {n} chunk(s)")
+        print(f"  CRFs: {dict(sorted(crf_counts.items()))}")
 
         # ---- concat + mux ----
         listfile = os.path.join(workdir, "concat.txt")
@@ -714,10 +625,8 @@ def main():
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", listfile,
-            "-c", "copy",
-            video_only,
+            "-c", "copy", video_only,
         ])
-        print("Muxing final output...")
         mux_cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_only]
         if audio_path:
             mux_cmd += ["-i", audio_path, "-map", "0:v:0", "-map", "1:a:0"]
@@ -725,20 +634,16 @@ def main():
         run(mux_cmd)
 
         final_mb = filesize(args.output) / (1024 * 1024)
-        print(f"\nDone → {args.output} ({final_mb:.2f} MB)")
-        size_err = abs(final_mb - args.target_mb) / args.target_mb * 100
-        print(f"Size error: {size_err:.1f}% of target")
+        err_pct = abs(final_mb - args.target_mb) / args.target_mb * 100
+        print(f"\nDone → {args.output} ({final_mb:.2f} MB, {err_pct:.1f}% error)")
 
         if cleanup_on_success:
             shutil.rmtree(workdir, ignore_errors=True)
         else:
-            print(f"Workdir kept at {workdir} "
-                  f"(rerun with same --workdir to reuse)")
+            print(f"Workdir kept at {workdir}")
     except BaseException:
-        # On any failure (including KeyboardInterrupt), preserve workdir so
-        # the run can be resumed.
         if not cleanup_on_success:
-            print(f"\nWorkdir preserved at {workdir} for resume")
+            print(f"\nWorkdir preserved at {workdir}")
         raise
 
 
