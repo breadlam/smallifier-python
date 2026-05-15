@@ -82,15 +82,22 @@ VALID_MP4_MIN_BYTES  = 1024
 # ---------------- SHELL / PROBE HELPERS ---------------- #
 
 def run(cmd):
+    # Auto-inject -nostdin for ffmpeg so it doesn't put the terminal into
+    # raw mode trying to capture keystrokes. Combined with stdin=DEVNULL,
+    # this prevents any chance of terminal corruption on abnormal exit.
+    if cmd and cmd[0] == "ffmpeg" and "-nostdin" not in cmd:
+        cmd = [cmd[0], "-nostdin"] + list(cmd[1:])
     subprocess.run(cmd, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
 
 def ffprobe_duration(path):
     out = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", path,
-    ])
+    ], stdin=subprocess.DEVNULL)
     return float(out.strip())
 
 def ffprobe_video(path):
@@ -99,7 +106,7 @@ def ffprobe_video(path):
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
         "-of", "json", path,
-    ])
+    ], stdin=subprocess.DEVNULL)
     s = json.loads(out)["streams"][0]
     num, den = s["r_frame_rate"].split("/")
     fps = float(num) / float(den) if float(den) else 30.0
@@ -111,7 +118,7 @@ def has_audio(path):
         "-select_streams", "a:0",
         "-show_entries", "stream=codec_type",
         "-of", "default=noprint_wrappers=1:nokey=1", path,
-    ]).strip()
+    ], stdin=subprocess.DEVNULL).strip()
     return out == b"audio"
 
 def filesize(path):
@@ -120,7 +127,9 @@ def filesize(path):
 def ffprobe_valid(path):
     try:
         subprocess.run(["ffprobe", "-v", "error", path],
-                       check=True, stdout=subprocess.DEVNULL,
+                       check=True,
+                       stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=15)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
@@ -245,14 +254,15 @@ def compute_vmaf(distorted, reference, start, dur, out_w, out_h, out_fps, thread
         f":log_fmt=json:log_path={log_path}"
     )
     subprocess.run([
-        "ffmpeg", "-loglevel", "error",
+        "ffmpeg", "-nostdin", "-loglevel", "error",
         "-i", distorted,
         "-ss", f"{start:.6f}",
         "-i", reference,
         "-t", f"{dur:.6f}",
         "-lavfi", filt,
         "-f", "null", "-",
-    ], check=True)
+    ], check=True, stdin=subprocess.DEVNULL,
+       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return _parse_vmaf_json(log_path)
 
 
