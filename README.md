@@ -2,11 +2,11 @@
 
 > Pin a video to an exact size. Maximize quality within that envelope.
 
-A specialized AV1 encoder for size-budgeted video distribution. Optimized for fast-motion content with on-screen text, where conventional encoders compromise text legibility first. (I use it to post video game clips to discord.)
+A specialized command-line AV1 encoder for size-budgeted video distribution. Optimized for fast-motion content with on-screen text, where conventional encoders compromise text legibility first. (I use it to post video game clips to discord.)
 
 The naive way to hit a size target is to compute `target_bits / duration` and feed it as a bitrate to a two-pass encoder. The result is uniform mediocrity: easy scenes get more bits than they need, hard scenes get fewer than they need, and aggressive size targets produce uniformly poor output across the whole video. This tool does something different.
 
-## How it works
+## Some Notes On How It Works
 
 **Per-scene convex-hull search.** [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) splits the source at shot boundaries. For each scene independently, the encoder samples a grid of (resolution × CRF) operating points and measures the (size, VMAF) curve for that scene. The Pareto frontier of those points captures the actual rate-quality tradeoff for *this specific content* — not an average over all scenes, not a guess from heuristics, not a learned model. The grid is the probe.
 
